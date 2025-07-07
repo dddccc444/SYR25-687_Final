@@ -1,0 +1,1582 @@
+---
+title: "Predicting Post-COVID Elections Using Pre-COVID Data"
+author: "Michael Suder, Jeong Hwan Son, Darrell Collison, Bobby Nitto"
+date: "2025-06-05"
+output: 
+  html_document: 
+    toc: true 
+    toc_depth: 5
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+```
+
+## Introduction
+
+Our team used census and demographic data from elections prior to 2020
+to develop models that predict the outcome of the 2020 presidential
+election. Incorporating categorical variables like gender,
+race/ethnicity and voter education along with continuous variables like
+median household income, median home value and median age provided us
+with many key insights we include in our presentation. This document
+details the steps we took to ingest, transform and model our data. We
+evaluate our models throughout this document in different ways and
+summarize our findings at the end.
+
+### Libraries
+
+We use the following libraries in our code below.
+
+sqldf, lubricate, tidyverse, readxl, Amelia, tidymodels, caTools, pROC, brglm2, randomForest, caret, corrr, janitor, patchwork, imputeTS, rLang
+
+```{r include=FALSE}
+if(!require(sqldf)){
+  install.packages("sqldf")
+  require(sqldf)
+}
+
+if(!require(lubridate)){
+  install.packages("lubridate")
+  require(lubridate)
+}
+
+if(!require(tidyverse)){
+  install.packages("tidyverse")
+  require(tidyverse)
+}
+
+if(!require(readxl)){
+  install.packages("readxl")
+  require(readxl)
+}
+
+if(!require(Amelia)){
+  install.packages("Amelia")
+  require(Amelia)
+}
+
+if(!require(tidymodels)){
+  install.packages("tidymodels")
+  require(tidymodels)
+}
+
+if(!require(caTools)){
+  install.packages("caTools")
+  require(caTools)
+}
+
+if(!require(pROC)){
+  install.packages("pROC")
+  require(pROC)
+}
+
+if(!require(brglm2)){
+  install.packages("brglm2")
+  require(brglm2)
+}
+
+if(!require(randomForest)){
+  install.packages("randomForest")
+  require(randomForest)
+}
+
+if(!require(caret)){
+  install.packages("caret")
+  require(caret)
+}
+
+if(!require(corrr)){
+  install.packages("corrr")
+  require(corrr)
+}
+
+if(!require(janitor)){
+  install.packages("janitor")
+  require(janitor)
+}
+
+if(!require(patchwork)){
+  install.packages("patchwork")
+  require(patchwork)
+}
+
+
+if(!require(imputeTS)){
+  install.packages("imputeTS")
+  require(imputeTS)
+}
+
+if(!require(rlang)) {
+  install.packages("rlang")
+  require(rlang)
+}
+
+if(!require(xgboost)){
+  install.packages("xgboost")
+  require(xgboost)
+}
+
+if(!require(smotefamily)){
+  install.packages("smotefamily")
+  require(smotefamily)
+}
+
+if(!require(ggmap)){
+  install.packages("ggmap")
+  require(ggmap)
+}
+
+#require(shorty)
+```
+
+### Functions
+
+These functions wrote ourselves and used at different points in the document.
+
+This function finds NA values in a data
+set and returns the counts by column.
+
+```{r}
+summarizeNAs <- function(df) {
+  col_type <- sapply(df,function(col) class(col))
+  na_count <- sapply(df, function(col)
+    sum(is.na(col)))
+  complete_records <- sapply(df,function(col)
+    sum(!is.na(col)))
+  total_records <- nrow(df)
+  percent_complete <- scales::percent(complete_records/total_records)
+  dfOut <- data.frame(col_type,na_count=na_count,complete_records,total_records,percent_complete)
+  dfOut <- dfOut %>% filter(na_count>1)
+  return(dfOut)
+}
+```
+
+This function creates a csv file from a data frame with a time stamp.
+Helpful to compare training runs
+
+```{r}
+TstampCSV <- function(df) {
+  df_name <- deparse(substitute(df))
+  timeStamp <- format(Sys.time(), "%m%d%Y_%H%M%S")
+  outFileName <- paste0(df_name,"_",timeStamp,".csv")
+  outFile <- write_csv(df,outFileName)
+  return(outFile)
+}
+```
+
+## Data Ingestion & Transformation
+
+This section details the steps taken to ingest and transform our data prior to
+merging into our analysis data set.
+
+Setting the working directory.
+
+```{r}
+# path = '~/Documents/02 - Education/01 - Syracuse/01 - Spring 2025/01 - Intro to Data Science/12 - Final Project/03 - Code/00 - Data'
+path = 'G:/내 드라이브/MasterDegree/2025 Spring/IST687/team_pjt'
+list.files(path)
+```
+
+### MIT County Census Data
+
+Reading in the MIT County Census data
+
+```{r}
+mit_county_data <- read_csv(file.path(path, "countypres_2000-2020.csv"))
+```
+
+We start by looking for missing values in the county_fips vector which
+we will need in our join later on.
+
+```{r}
+mit_county_data_na_cols <- mit_county_data %>%
+  filter(is.na(county_fips)) %>%
+  distinct(county_name)
+mit_county_data_na_cols
+```
+
+Using our custom function to provide details on the number of records
+with missing county_fips data in mit_county_data.
+
+```{r}
+summarizeNAs(mit_county_data)
+```
+
+We remove the records with missing county_fips codes as the portion is
+statistically insignificant. The missing counties also appear to be
+special cases and should not impact the outcome of our analysis.
+
+```{r}
+mit_county_data <- mit_county_data %>%
+  filter(!county_name %in% mit_county_data_na_cols$county_name)
+```
+
+There are a few states with missing vote totals so we find the
+year-state combinations with missing TOTAL rows to identify where we
+need to make adjustments to the data.
+
+```{r}
+z_state_Total_exisits <- mit_county_data %>% 
+  select(year, state_po, mode) %>% 
+  distinct_all() %>% 
+  mutate(total_exists = if_else(mode == "TOTAL", 1,0)) %>% 
+  group_by(year, state_po, mode) %>% 
+  slice_max(order_by = total_exists, n = 1, with_ties = F) %>% 
+  ungroup() %>% 
+  # filter(year == 2020) %>% 
+  group_by(year, state_po) %>% 
+  summarise(total_exists = sum(total_exists)) %>% 
+  ungroup() %>% 
+  filter(total_exists <1) %>% 
+  select(year, state_po) %>% 
+  distinct_all()
+```
+
+Identifying the year(s) and state(s) with missing totals and storing them as vectors.
+
+```{r}
+## get vector for missing year and state (if any)
+missing_total_years <- z_state_Total_exisits$year
+missing_total_state <- z_state_Total_exisits$state_po
+```
+
+We then filter the MIT County Census data to records missing total vote
+counts identified previously using the vectors above and aggregate the
+total vote using the totals from the detailed voting types.
+
+```{r}
+## Create append for the Total values for each year, state, county, party
+missing_total_sums_for_append <- mit_county_data %>% 
+  filter(year %in% missing_total_years
+         , state_po %in% missing_total_state
+  ) %>% 
+  group_by(
+    year
+    ,state
+    ,state_po
+    ,county_name
+    ,county_fips
+    ,office
+    ,candidate
+    ,party
+    ,totalvotes
+    ,version
+  ) %>% 
+  summarise(candidatevotes = sum(candidatevotes)) %>% 
+  ungroup() %>% 
+  mutate(mode = "TOTAL") %>% 
+  relocate("mode", .after = "version")
+```
+
+This code appends the aggregated missing totals back to the data set and
+the MIT data is now ready to be merged with the Electoral College data
+set.
+
+```{r}
+mit_county_data_check <- union_all(mit_county_data, missing_total_sums_for_append) %>% 
+  filter(mode == "TOTAL")
+```
+
+Visualizing the number of voting records we have for each year.
+
+```{r}
+# Filter only TOTAL mode
+mit_county_data_check_total <- mit_county_data_check %>% 
+  filter(mode == "TOTAL")
+
+mit_county_vote_summary_total <- mit_county_data_check_total %>%
+  group_by(year) %>%
+  count(mode) %>% mutate(yearMode = paste(as.character(year), mode))
+
+mit_county_vote_summary_total %>% ggplot(
+  aes(x = fct_reorder(yearMode,-n),y=n)) +
+    geom_bar(stat = "identity") + theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    ggtitle(paste("Vote Frequency by Year")) + 
+    xlab("Year Total") + 
+    ylab("Frequency")
+```
+
+### Electoral College Data
+
+Reading in the Electoral College data set from Kaggle.
+
+```{r}
+electoral_college_votes <- read_csv(file.path(path, "electoral_college.csv"))
+```
+
+We only want the data for the years 2000 to 2020.
+
+```{r}
+electoral_college_votes <- electoral_college_votes %>% filter(Year >=2000)
+```
+
+The columns need to be renamed before we are able to join with the MIT
+County Census data.
+
+```{r}
+colnames(electoral_college_votes) <- c("year", "state", "ec_votes")
+```
+
+### Merging MIT and Electoral College Data
+
+Using left join to bring the two data sets together.
+
+```{r}
+mit_county_ec_data_clean <- mit_county_data_check %>%
+  left_join(electoral_college_votes %>% mutate(state = toupper(state)),
+            by = c("year", "state")) %>%
+  group_by(year, state_po, county_fips) %>%
+  mutate(winner = party[which.max(candidatevotes)]) %>%
+  ungroup()
+```
+
+Taking a look at the structure of the merged MIT County and Electoral
+College Data
+
+```{r}
+glimpse(mit_county_ec_data_clean)
+head(mit_county_ec_data_clean)
+```
+
+Optionally use the function we created to export the merged data with a
+data and time stamp.
+
+```{r}
+#TstampCSV(mit_county_ec_data_clean)
+```
+
+### County Census API Data
+
+Reading in the County Census API data. This step required two api calls
+to generate the xlsx files we use in our model.
+
+```{r}
+census_data_2012_2020 <- read_excel(file.path(path, "2012-2020 US Census ACS5 Curated Export.xlsx"))
+colnames(census_data_2012_2020)[colnames(census_data_2012_2020) == "Total_Feales"] <- "Total_Females"
+
+census_data_2009 <- read_excel(file.path(path, "2009 US Census ACS5 Curated Export.xlsx"))
+colnames(census_data_2009)[colnames(census_data_2009) == "Total_Feales"] <- "Total_Females"
+```
+
+Combining the 2 files we have to create a single data set
+
+```{r}
+census_data_bind <- bind_rows(census_data_2012_2020, census_data_2009)
+colnames(census_data_bind) <- tolower(colnames(census_data_bind))
+```
+
+We found that Employed, Unemployed and Not in Labor Force vectors are
+missing values. Interpolation is applied to those values to
+impute the missing data.
+
+```{r}
+census_data_impute <- census_data_bind %>% 
+  select(-ged_or_alternative) %>% 
+  group_by(state, fips) %>% 
+  mutate(
+    employed = na_interpolation(employed, option = "linear") ## Impute Employed
+    ,unemployed = na_interpolation(unemployed, option = "linear") ## Impute Unemployed
+    ,not_in_labor_force = na_interpolation(not_in_labor_force, option = "linear") ## Impute Not in Labor force
+  ) %>% ungroup()
+```
+
+Here we are applying the 2009 census data to 2008 voting data because that was the earliest data we could find.  Our assumption is that voter demographics did not change dramatically between 2008 and 2009.
+
+```{r}
+census_data <- census_data_impute %>% 
+  mutate(join_year = if_else(year == 2009, 2008, year))
+```
+
+### Merging the Final Data Frame
+
+Merging the clean MIT County and Electoral College data with the API
+Census Data to create our final merged data set.
+
+```{r}
+merged_df <-  mit_county_ec_data_clean %>% 
+  left_join(census_data %>%
+              select(-state, -year) %>%
+              ## presidential returns FIPS data does not have leading zeros and is numeric
+              mutate(fips = as.numeric(fips)), by = c("county_fips" = "fips", "year"= "join_year")) %>% 
+  filter(is.na(county_fips) == F) %>% 
+  na.omit()
+```
+
+Creating two subsets of the merged data set with only winners to use in
+our prediction models.
+
+```{r}
+merged_df_winners_Pre2020 <- merged_df %>% 
+  filter(year < 2020)%>% 
+  filter(party == winner) %>% 
+  select(5,9,10,14,16:46) %>% 
+  distinct_all()
+
+merged_df_winners_2020 <- merged_df %>% 
+  filter(year == 2020) %>% 
+  filter(party == winner) %>% 
+  select(5,9,10,14,16:46) %>% 
+  distinct_all()
+```
+
+## Summarizing our Merged Data
+
+This section includes the code used to generate the charts for our continuous and categorical variables displayed in our presentation.
+
+Confirming the columns and data types.
+
+```{r}
+glimpse(merged_df)
+```
+
+Verifying there are no missing records using the Amelia library and the
+missmap function. The function we wrote to check for NAs also returns no
+missing records.
+
+```{r}
+missmap(merged_df)
+summarizeNAs(merged_df)
+```
+
+### Visualizing Continuous Variables
+
+#### Facet Bar Chart
+
+```{r}
+median_vars_df <- merged_df %>% select(
+  year,
+  median_household_income,
+  median_home_value,
+  median_mortgage_payment
+) %>% group_by(year) %>% summarise(
+    med_median_household_income = median(median_household_income, na.rm =TRUE),
+    med_median_home_value = median(median_home_value, na.rm = TRUE),
+    med_median_mortgage_payment = median(median_mortgage_payment, na.rm = TRUE))
+head(median_vars_df)
+```
+
+```{r}
+median_vars_df_pivot <- median_vars_df %>% pivot_longer(cols = c(med_median_home_value,med_median_household_income,med_median_mortgage_payment), names_to = "variable", values_to = "value") %>% mutate(
+    variable = recode(
+      variable,
+      med_median_home_value = "Home Value",
+      med_median_household_income = "Household Income",
+      med_median_mortgage_payment = "Mortgage Payment"
+    ),
+    variable = factor(variable, levels = c(
+      "Home Value",
+      "Household Income",
+      "Mortgage Payment"
+    ))
+  )
+median_vars_df_pivot$year <- as.factor(median_vars_df_pivot$year)
+head(median_vars_df_pivot,20)
+```
+
+```{r}
+fill_colors <- c(
+  "Home Value" = "darkblue",
+  "Household Income" = "orange",
+  "Mortgage Payment" = "darkgrey"
+)
+ggplot(median_vars_df_pivot, aes(x = year, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values=fill_colors) +
+  scale_y_continuous(labels = dollar_format()) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(title = "Medians by Election Year",
+       x = "Year",
+       y = "Dollars") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+#### Box Plots
+
+##### Median Home Value
+
+```{r}
+median_home_value_df_box <- merged_df %>% select(
+  year,
+  median_home_value,
+) %>% group_by(year)
+
+mhv_quartiles_df <- median_home_value_df_box %>%
+  group_by(year) %>%
+  summarise(
+    Q1 = quantile(median_home_value, 0.25, na.rm = TRUE),
+    Median = quantile(median_home_value, 0.5, na.rm = TRUE),
+    Q3 = quantile(median_home_value, 0.75, na.rm = TRUE)
+  )
+
+median_home_value_df_box
+```
+
+```{r}
+ggplot(median_home_value_df_box, aes(x = factor(year), y = median_home_value)) +
+  geom_boxplot(fill = "orange", color = "darkblue", outlier.color = "darkred") +
+  geom_text(data = mhv_quartiles_df, aes(x = factor(year), y = Q1, label = paste0("Q1: ", dollar(Q1))), 
+            vjust = 1.4, size = 3, color = "black") +
+  geom_text(data = mhv_quartiles_df, aes(x = factor(year), y = Median, label = paste0("Median: ", dollar(Median))), 
+            vjust = -.3, size = 3, color = "black") +
+  geom_text(data = mhv_quartiles_df, aes(x = factor(year), y = Q3, label = paste0("Q3: ", dollar(Q3))), 
+            vjust = -1.2, size = 3, color = "black") +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(
+    title = "Median Home Value with Quartiles",
+    x = "Year",
+    y = "Median Home Value"
+  ) + theme_minimal()
+
+```
+
+##### Median Household Income
+
+```{r}
+# create the data set
+median_household_income_df_box <- merged_df %>% select(
+  year,
+  median_household_income,
+) %>% group_by(year)
+
+mhi_quartiles_df <- median_household_income_df_box %>%
+  group_by(year) %>%
+  summarise(
+    Q1 = quantile(median_household_income, 0.25, na.rm = TRUE),
+    Median = quantile(median_household_income, 0.5, na.rm = TRUE),
+    Q3 = quantile(median_household_income, 0.75, na.rm = TRUE)
+  )
+
+median_household_income_df_box
+```
+
+```{r}
+ggplot(median_household_income_df_box, aes(x = factor(year), y = median_household_income)) +
+  geom_boxplot(fill = "orange", color = "darkblue", outlier.color = "darkred") +
+  geom_text(data = mhi_quartiles_df, aes(x = factor(year), y = Q1, label = paste0("Q1: ", dollar(Q1))), 
+            vjust = 1.4, size = 3, color = "black") +
+  geom_text(data = mhi_quartiles_df, aes(x = factor(year), y = Median, label = paste0("Median: ", dollar(Median))), 
+            vjust = -.3, size = 3, color = "black") +
+  geom_text(data = mhi_quartiles_df, aes(x = factor(year), y = Q3, label = paste0("Q3: ", dollar(Q3))), 
+            vjust = -1.2, size = 3, color = "black") +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(
+    title = "Median Household Income with Quartiles",
+    x = "Year",
+    y = "Median Household Income"
+  ) + theme_minimal()
+
+```
+
+##### Median Mortgage Payment
+
+```{r}
+median_mortgage_payment_df_box <- merged_df %>% select(
+  year,
+  median_mortgage_payment,
+) %>% group_by(year)
+
+mmp_quartiles_df <- median_mortgage_payment_df_box %>%
+  group_by(year) %>%
+  summarise(
+    Q1 = quantile(median_mortgage_payment, 0.25, na.rm = TRUE),
+    Median = quantile(median_mortgage_payment, 0.5, na.rm = TRUE),
+    Q3 = quantile(median_mortgage_payment, 0.75, na.rm = TRUE)
+  )
+
+median_mortgage_payment_df_box
+```
+
+```{r}
+ggplot(median_mortgage_payment_df_box, aes(x = factor(year), y = median_mortgage_payment)) +
+  geom_boxplot(fill = "orange", color = "darkblue", outlier.color = "darkred") +
+  geom_text(data = mmp_quartiles_df, aes(x = factor(year), y = Q1, label = paste0("Q1: ", dollar(Q1))), 
+            vjust = 1.4, size = 3, color = "black") +
+  geom_text(data = mmp_quartiles_df, aes(x = factor(year), y = Median, label = paste0("Median: ", dollar(Median))), 
+            vjust = -.3, size = 3, color = "black") +
+  geom_text(data = mmp_quartiles_df, aes(x = factor(year), y = Q3, label = paste0("Q3: ", dollar(Q3))), 
+            vjust = -1.2, size = 3, color = "black") +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(
+    title = "Median Mortgage Payment with Quartiles",
+    x = "Year",
+    y = "Median Household Income"
+  ) + theme_minimal()
+
+```
+
+##### Median Age
+
+```{r}
+# create the data set
+median_age_df_box <- merged_df %>% select(
+  year,
+  median_age,
+) %>% group_by(year)
+
+mage_quartiles_df <- median_age_df_box %>%
+  group_by(year) %>%
+  summarise(
+    Q1 = quantile(median_age, 0.25, na.rm = TRUE),
+    Median = quantile(median_age, 0.5, na.rm = TRUE),
+    Q3 = quantile(median_age, 0.75, na.rm = TRUE)
+  )
+
+median_age_df_box
+```
+
+```{r}
+ggplot(median_age_df_box, aes(x = factor(year), y = median_age)) +
+  geom_boxplot(fill = "orange", color = "darkblue", outlier.color = "darkred") +
+  geom_text(data = mage_quartiles_df, aes(x = factor(year), y = Q1, label = paste0("Q1: ", Q1)), 
+            vjust = 1.4, size = 3, color = "black") +
+  geom_text(data = mage_quartiles_df, aes(x = factor(year), y = Median, label = paste0("Median: ", Median)), 
+            vjust = -.3, size = 3, color = "black") +
+  geom_text(data = mage_quartiles_df, aes(x = factor(year), y = Q3, label = paste0("Q3: ", Q3)), 
+            vjust = -1.2, size = 3, color = "black") +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(
+    title = "Median Age with Quartiles",
+    x = "Year",
+    y = "Age"
+  ) + theme_minimal()
+
+```
+
+### Visualizing Categorical Variables
+
+#### Race/Ethnicity by Election Year
+
+```{r}
+race_ethnicity_df <- merged_df %>% select(
+  year,
+  white,
+  black,
+  native_hawaiian_pacific_islander,
+  american_indian_alaska_native,
+  asian_alone,
+  other_race,
+  hispanic_or_latino
+) %>% group_by(year) %>%
+  summarise(
+    total_white = sum(white, na.rm = TRUE),
+    total_black = sum(black, na.rm = TRUE),
+    total_nhpi = sum(native_hawaiian_pacific_islander),
+    total_aian = sum(american_indian_alaska_native),
+    total_asian_alone = sum(asian_alone),
+    total_other_race = sum(other_race),
+    total_his_or_lat = sum(hispanic_or_latino)
+  ) %>% mutate(total_population=total_white+total_black+total_nhpi+total_aian+total_asian_alone+total_other_race+total_his_or_lat)
+```
+
+```{r}
+re_df_pivot <- race_ethnicity_df %>% select(-total_population) %>% pivot_longer(cols = c(total_white,total_black,total_nhpi,total_aian,total_asian_alone,total_other_race,total_his_or_lat), names_to = "variable", values_to = "value") %>% mutate(variable = recode(variable,
+                           total_white = "White",
+                           total_black = "Black or African American",
+                           total_nhpi = "Native Hawaiian Pacific Islander",
+                           total_aian = "American Indian Alaska Native",
+                           total_asian_alone = "Asian",
+                           total_his_or_lat = "Hispanic or Latino",
+                           total_other_race = "Other"))
+re_df_pivot <- re_df_pivot %>% group_by(year) %>% mutate(percentage=value/sum(value))
+re_df_pivot$year <- as.factor(re_df_pivot$year)
+head(re_df_pivot,20)
+```
+
+```{r}
+re_fill_colors <- c(
+  "White" = "darkblue",
+  "Black or African American" = "darkorange",
+  "Native Hawaiian Pacific Islander" = "darkgrey",
+  "American Indian Alaska Native" = "blue",
+  "Asian" = "orange",
+  "Hispanic or Latino" = "gray",
+  "Other" = "lightblue" 
+)
+ggplot(re_df_pivot, aes(x = year, y = percentage, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(name = "Race/Ethnicity",values = re_fill_colors) +
+  labs(title = "Voter Race/Ethnicity by Election Year",
+       x = "Year",
+       y = "Percentage") +
+  theme_minimal()
+```
+
+#### Citizenship by Election Year
+
+```{r}
+citizenship_df <- merged_df %>% select(
+  year,
+  citizen,
+  non_citizen
+) %>% group_by(year) %>%
+  summarise(
+    total_citizen = sum(citizen, na.rm = TRUE),
+    total_non_citizen = sum(non_citizen, na.rm = TRUE),
+  ) %>% mutate(total=total_citizen + total_non_citizen)
+head(citizenship_df)
+```
+
+```{r}
+citizenship_df_pivot <- citizenship_df %>% pivot_longer(cols = c(total_citizen,total_non_citizen), names_to = "variable", values_to = "value") %>% mutate(variable = recode(variable,
+                           total_citizen = "Citizen",
+                           total_non_citizen = "Non-Citizen"))
+citizenship_df_pivot <- citizenship_df_pivot %>% group_by(year) %>% mutate(percentage=value/sum(value))
+citizenship_df_pivot$year <- as.factor(citizenship_df_pivot$year)
+head(citizenship_df_pivot,20)
+```
+
+```{r}
+c_fill_colors <- c("Citizen" = "darkblue", "Non-Citizen"="orange")
+ggplot(citizenship_df_pivot, aes(x = year, y = percentage, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(name = "Citizenship", values = c_fill_colors) +
+  labs(title = "Voter Citizenship by Election Year",
+       x = "Year",
+       y = "Percentage of Voters") +
+  theme_minimal()
+```
+
+#### Education Level by Year
+
+```{r}
+education_df <- merged_df %>% select(
+  year,
+  high_school_education,
+  associates_degree,
+  bachelor_degree,
+  masters_degree,
+  doctoral_degree
+) %>% group_by(year) %>%
+  summarise(
+    total_high_school = sum(high_school_education, na.rm = TRUE),
+    total_associates = sum(associates_degree, na.rm = TRUE),
+    total_bachelor = sum(bachelor_degree,na.rm=TRUE),
+    total_masters = sum(masters_degree,na.rm=TRUE),
+    total_doctoral = sum(doctoral_degree,na.rm=TRUE)
+  ) %>% mutate(total=total_high_school+total_associates+total_bachelor+total_masters+total_doctoral)
+head(education_df)
+```
+
+```{r}
+education_df_pivot <- education_df %>% pivot_longer(cols = c(total_high_school,total_associates,total_bachelor,total_masters,total_doctoral), names_to = "variable", values_to = "value") %>% mutate(variable = recode(variable,
+                           total_high_school = "High School Diploma",
+                           total_associates = "Associates Degree",
+                           total_bachelor = "Bachelors Degree",
+                           total_masters = "Masters Degree",
+                           total_doctoral = "Doctorate Degree"))
+education_df_pivot <- education_df_pivot %>% group_by(year) %>% mutate(percentage=value/sum(value))
+education_df_pivot$year <- as.factor(education_df_pivot$year)
+head(education_df_pivot,20)
+```
+
+```{r}
+e_fill_colors <- c("High School Diploma" = "darkblue", "Associates Degree"="orange","Bachelors Degree"="darkgrey","Masters Degree"="blue","Doctorate Degree" = "darkorange")
+ggplot(education_df_pivot, aes(x = year, y = percentage, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(name = "Education", values = e_fill_colors) +
+  labs(title = "Voter Education by Election Year",
+       x = "Year",
+       y = "Percentage of Voters") +
+  theme_minimal()
+```
+
+#### Employment by Election Year
+
+```{r}
+employment_df <- merged_df %>% select(
+  year,
+  employed,
+  unemployed,
+  not_in_labor_force
+) %>% group_by(year) %>%
+  summarise(
+    total_employed = sum(employed, na.rm = TRUE),
+    total_unemployed = sum(unemployed, na.rm = TRUE),
+    total_not_in_labor_force = sum(not_in_labor_force, na.rm= TRUE)) %>%
+  mutate(total=total_employed + total_unemployed)
+head(employment_df)
+```
+
+```{r}
+employment_df_pivot <- employment_df %>% select(-total) %>% pivot_longer(
+  cols = c(total_employed, total_unemployed, total_not_in_labor_force),
+  names_to = "variable",
+  values_to = "value"
+) %>% mutate(variable = recode(
+  variable,
+  total_employed = "Employed",
+  total_unemployed = "Unemployed",
+  total_not_in_labor_force = "Not in Labor Force"
+))
+
+employment_df_pivot <- employment_df_pivot %>% group_by(year) %>% mutate(percentage =
+                                                                         value / sum(value))
+employment_df_pivot$year <- as.factor(employment_df_pivot$year)
+head(employment_df_pivot,20)
+```
+
+```{r}
+emp_fill_colors <- c("Employed"="darkblue","Unemployed"="orange","Not in Labor Force"="gray")
+ggplot(employment_df_pivot, aes(x = year, y = percentage, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(name = "Employment Status",values = emp_fill_colors) +
+  labs(title = "Voter Employment Status by Election Year",
+       x = "Year",
+       y = "Percentage of Voters") +
+  theme_minimal()
+```
+
+#### Marital Status by Election Year
+
+```{r}
+marital_status_df <- merged_df %>% select(
+  year,
+  never_married,
+  spouse_present,
+  spouse_absent,
+  spouse_seperated,
+  widowed
+) %>% group_by(year) %>%
+  summarise(
+    total_never_married = sum(never_married, na.rm = TRUE),
+    total_spouse_present = sum(spouse_present, na.rm = TRUE),
+    total_spouse_absent = sum(spouse_absent, na.rm= TRUE),
+    total_spouse_seperated = sum(spouse_seperated, na.rm=TRUE),
+    total_widowed = sum(widowed,na.rm=TRUE)) %>%
+  mutate(total=total_never_married + total_spouse_present + total_spouse_absent + total_spouse_seperated + total_widowed)
+head(marital_status_df)
+```
+
+```{r}
+marital_status_df_pivot <- marital_status_df %>% select(-total) %>% pivot_longer(
+  cols = c(total_never_married, total_spouse_present, total_spouse_absent, total_spouse_seperated,total_widowed),
+  names_to = "variable",
+  values_to = "value"
+) %>% mutate(variable = recode(
+  variable,
+  total_never_married = "Never Married",
+  total_spouse_present = "Spouse Present",
+  total_spouse_absent = "Spouse Absent",
+  total_spouse_seperated = "Spouse Seperated",
+  total_widowed = "Widowed"
+))
+
+marital_status_df_pivot <- marital_status_df_pivot %>% group_by(year) %>% mutate(percentage =
+                                                                         value / sum(value))
+marital_status_df_pivot$year <- as.factor(marital_status_df_pivot$year)
+head(marital_status_df_pivot,20)
+```
+
+```{r}
+mar_fill_colors <- c("Never Married"="darkblue","Spouse Present"="orange","Spouse Absent"= "gray", "Spouse Seperated"="blue","Widowed"="darkorange")
+ggplot(marital_status_df_pivot, aes(x = year, y = percentage, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(name = "Marital Status",values=mar_fill_colors) +
+  labs(title = "Voter Marital Status by Election Year",
+       x = "Year",
+       y = "Percentage of Voters") +
+  theme_minimal()
+```
+
+#### Gender by Election Year
+
+```{r}
+gender_df <- merged_df %>% select(
+  year,
+  total_males,
+  total_females
+) %>% group_by(year) %>% 
+  summarise(
+    total_males = sum(total_males,na.rm=TRUE),
+    total_females = sum(total_females,na.rm=TRUE)
+  )
+```
+
+```{r}
+gender_df_pivot <- gender_df %>% pivot_longer(
+  cols = c(total_males, total_females),
+  names_to = "variable",
+  values_to = "value"
+) %>% mutate(variable = recode(variable, 
+                               total_males = "Male", 
+                               total_females = "Female", ))
+gender_df_pivot <- gender_df_pivot %>% group_by(year) %>% mutate(percentage = value / sum(value))
+gender_df_pivot$year <- as.factor(gender_df_pivot$year)
+head(gender_df_pivot,20)
+```
+
+```{r}
+gend_fill_colors <- c("Male"="darkblue","Female"="orange")
+ggplot(gender_df_pivot, aes(x = year, y = percentage, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(name = "Gender",values=gend_fill_colors) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Voter Gender by Election Year",
+       x = "Year",
+       y = "Percent") +
+  theme_minimal()
+```
+
+### Total Vote Maps
+
+Getting total votes by state and year from merged_df.
+
+```{r}
+state_votes <- merged_df %>% select(year,state,totalvotes) %>% group_by(year,state)
+state_votes <- state_votes %>% mutate(state=tolower(state))
+head(state_votes)
+```
+Merging total vote and state geometry data for the maps.
+
+```{r}
+state_geomDf <- map_data("state")
+merged_state_votes_geom <- merge(state_votes, state_geomDf,by.x = "state", by.y = "region")
+head(merged_state_votes_geom)
+```
+
+Creating data sets for each map.
+
+```{r}
+merged_state_votes_geom_08 <- merged_state_votes_geom %>% filter(year==2008) %>% group_by(year,state,order,group,lat,long) %>% summarise(state_total_votes = sum(totalvotes)) %>% ungroup()
+
+merged_state_votes_geom_12 <- merged_state_votes_geom %>% filter(year==2012) %>% group_by(year,state,order,group,lat,long) %>% summarise(state_total_votes = sum(totalvotes)) %>% ungroup()
+
+merged_state_votes_geom_16 <- merged_state_votes_geom %>% filter(year==2016) %>% group_by(year,state,order,group,lat,long) %>% summarise(state_total_votes = sum(totalvotes)) %>% ungroup()
+
+merged_state_votes_geom_20 <- merged_state_votes_geom %>% filter(year==2020) %>% group_by(year,state,order,group,lat,long) %>% summarise(state_total_votes = sum(totalvotes)) %>% ungroup()
+head(merged_state_votes_geom_08)
+```
+
+2008 Total Vote Map
+
+```{r}
+ggplot(merged_state_votes_geom_08) +
+  geom_polygon(color = "black", aes(
+    x = long,
+    y = lat,
+    group = state,
+    fill = state_total_votes
+  )) +
+  coord_map() +
+  scale_fill_gradient(
+    name = "Total Votes",        
+    low = "white",
+    high = "darkblue",
+    labels = scales::comma
+  ) + 
+  labs(
+    title = "Total Vote Heat Map: 2008"
+  ) + theme_void()
+```
+
+2012 Total Vote Map
+
+```{r}
+ggplot(merged_state_votes_geom_12) +
+  geom_polygon(color = "black", aes(
+    x = long,
+    y = lat,
+    group = state,
+    fill = state_total_votes
+  )) +
+  coord_map() +
+  scale_fill_gradient(
+    name = "Total Votes",        
+    low = "white",
+    high = "darkblue",
+    labels = scales::comma
+  ) + 
+  labs(
+    title = "Total Vote Heat Map: 2012"
+  ) + theme_void()
+```
+
+2016 Total Vote Map
+
+```{r}
+ggplot(merged_state_votes_geom_16) +
+  geom_polygon(color = "black", aes(
+    x = long,
+    y = lat,
+    group = state,
+    fill = state_total_votes
+  )) +
+  coord_map() +
+  scale_fill_gradient(
+    name = "Total Votes",        
+    low = "white",
+    high = "darkblue",
+    labels = scales::comma
+  ) + 
+  labs(
+    title = "Total Vote Heat Map: 2016"
+  ) + theme_void()
+```
+
+2020 Total Vote Map
+
+```{r}
+ggplot(merged_state_votes_geom_20) +
+  geom_polygon(color = "black", aes(
+    x = long,
+    y = lat,
+    group = state,
+    fill = state_total_votes
+  )) +
+  coord_map() +
+  scale_fill_gradient(
+    name = "Total Votes",        
+    low = "white",
+    high = "darkblue",
+    labels = scales::comma
+  ) + 
+  labs(
+    title = "Total Vote Heat Map: 2020"
+  ) + theme_void()
+```
+```{r}
+library(patchwork)
+
+# Set the overall data range
+min_value <- min(c(merged_state_votes_geom_08$state_total_votes, merged_state_votes_geom_20$state_total_votes))
+max_value <- max(c(merged_state_votes_geom_08$state_total_votes, merged_state_votes_geom_20$state_total_votes))
+
+# Define a common color scale
+color_scale <- scale_fill_gradient(
+  name = "Total Votes",
+  low = "white",
+  high = "darkblue",  # Ensure both graphs share the same color scale
+  limits = c(min_value, max_value),  # Set consistent min/max values
+  labels = scales::comma
+)
+
+# First map (2008)
+plot_08 <- ggplot(merged_state_votes_geom_08) +
+  geom_polygon(color = "black", aes(
+    x = long,
+    y = lat,
+    group = state,
+    fill = state_total_votes
+  )) +
+  coord_map() +
+  color_scale + 
+  labs(title = "Total Vote Heat Map: 2008") +
+  theme_void() +
+  theme(legend.position = "none")  # Remove the legend
+
+# Second map (2020)
+plot_20 <- ggplot(merged_state_votes_geom_20) +
+  geom_polygon(color = "black", aes(
+    x = long,
+    y = lat,
+    group = state,
+    fill = state_total_votes
+  )) +
+  coord_map() +
+  color_scale + 
+  labs(title = "Total Vote Heat Map: 2020") +
+  theme_void()
+
+# Combine the two graphs into a single layout (keeping only plot_20's legend)
+(plot_08 + plot_20) + plot_layout(nrow = 1, ncol = 2)
+
+```
+
+
+
+
+
+## Modeling
+
+This section details the steps taken to train, predict and evaluate our SVM and Random Forest models.
+
+### Training and Test Data Sets
+
+Creating our training and test data sets.
+
+```{r}
+set.seed(123)
+split_ds <- sample.split(merged_df_winners_Pre2020$winner, .70)
+train <- subset(merged_df_winners_Pre2020, split_ds == TRUE)
+test <- subset(merged_df_winners_Pre2020, split_ds == FALSE)
+```
+
+We scale our data to help improve the final accuracy of model.
+
+```{r}
+train_ds_scaled <- train %>% mutate(across(where(is.numeric), scale))
+test_ds_scaled <- test %>% mutate(across(where(is.numeric), scale))
+```
+
+### Support Vector Machine
+
+We first used a support vector machine with configurations we covered in
+our coursework to make a prediction using our training and test data.
+
+```{r}
+trnCntrl <- trainControl(method="cv", number=3)
+tune_grid = expand.grid(sigma= c(0.01, 0.05, 0.1),C=c(1,2,3))
+set.seed(123)
+svm_model <- train(winner~.,
+                   data=train_ds_scaled,
+                   method="svmRadial", 
+                   tuneGrid=tune_grid,
+                   trControl = trnCntrl,
+                   preProcess = c("center", "scale")
+                   )
+```
+
+#### Predictions & Evaluation
+
+Taking a look at the final model.
+
+```{r}
+svm_model$finalModel
+```
+
+Generating predictions.
+
+```{r}
+set.seed(123)
+svm_model_predictions <- predict(svm_model,
+                                newdata = select(test_ds_scaled, -winner),
+                                type = "raw")
+```
+
+Confusion Matrix.
+
+```{r}
+svm_conf_matrix <- confusionMatrix(as.factor(svm_model_predictions),as.factor(test_ds_scaled$winner))
+svm_conf_matrix
+```
+
+Accuracy.
+
+```{r}
+svm_accuracy <- sum(diag(svm_conf_matrix$table)) / sum(svm_conf_matrix$table)
+print(paste("Test Accuracy:", round(svm_accuracy, 3)))
+```
+
+Visualizing the Confusion Matrix.
+
+```{r}
+svm_cm_df <- as.data.frame(svm_conf_matrix$table)
+svm_cm_plot <- ggplot(data = svm_cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "All Data 2000-2020 Prediction Result", x = "Actual", y = "Predicted"
+       ,subtitle = "Support Vector Machine Model") +
+  theme_minimal()
+svm_cm_plot
+```
+
+While the accuracy of 88.7% seemed high however we feel that the model
+is memorizing the data. The Sensitivity represents the recall for
+DEMOCRAT and at 44.8% many actual Democratic winners are missed. The
+Specificity represents the recall for REPUBLICAN and at 2.4% nearly all
+actual Republican winners are incorrectly classified. The Precision for
+DEMOCRAT is 10.8% meaning most predicted Democratic winners are
+incorrect.
+
+### Base Random Forest Model
+
+We decided to try using a random forest model predict the winner based
+on the same training and test data we used in the SVM Model.
+
+```{r}
+set.seed(123)
+rf_base_model <- randomForest(as.factor(winner) ~ ., data = train_ds_scaled, ntree = 100, mtry = 3, importance = TRUE)
+```
+
+#### Predictions & Evalution
+
+Generating predictions.
+
+```{r}
+rf_base_predictions <- predict(rf_base_model, test_ds_scaled)
+```
+
+Confusion Matrix.
+
+```{r}
+rf_base_conf_matrix <- confusionMatrix(as.factor(rf_base_predictions), as.factor(test_ds_scaled$winner))
+print(rf_base_conf_matrix)
+```
+
+Accuracy.
+
+```{r}
+rf_base_accuracy <- sum(diag(rf_base_conf_matrix$table)) / sum(rf_base_conf_matrix$table)
+print(paste("Test Accuracy:", round(rf_base_accuracy, 3)))
+```
+
+Visualizing the Confusion Matrix.
+
+```{r}
+cmt <- as.data.frame(rf_base_conf_matrix$table)
+
+og_plot <- ggplot(data = cmt, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "All Data 2000-2020 Prediction Result", x = "Actual", y = "Predicted"
+       ,subtitle = "Base Model") +
+  theme_minimal()
+og_plot
+```
+
+#### Variable Importance
+
+A complete list of variables ordered by importance.
+
+```{r}
+importance(rf_base_model)
+```
+
+Visualized using varImpPlot
+
+```{r}
+varImpPlot(rf_base_model)
+```
+
+### Incorporating Cross-Validation
+
+In this version, we take our base model and add 5-fold cross-validation
+in order to help the model learn generally and does not memorize
+patterns.
+
+```{r}
+set.seed(123)
+train_control <- trainControl(method = "cv", number = 5)  # 5-Fold Cross Validation
+rf_cv_model <- train(
+  as.factor(winner) ~ .,
+  data = train_ds_scaled,
+  method = "rf",
+  trControl = train_control,
+  importance = TRUE
+)
+```
+
+#### Predictions & Evaluation
+
+Generating predictions with 5-fold cross-validation.
+
+```{r}
+rf_cv_predictions <- predict(rf_cv_model, test_ds_scaled)
+```
+
+Confusion Matrix.
+
+```{r}
+rf_cv_conf_matrix <- confusionMatrix(as.factor(rf_cv_predictions), as.factor(test_ds_scaled$winner))
+print(rf_cv_conf_matrix)
+```
+
+Accuracy.
+
+```{r}
+rf_cv_accuracy <- sum(diag(rf_cv_conf_matrix$table)) / sum(rf_cv_conf_matrix$table)
+print(paste("Test Accuracy:", round(rf_cv_accuracy, 3)))
+```
+
+Visualizing the Confusion Matrix.
+
+```{r}
+mt <- as.data.frame(rf_cv_conf_matrix$table)
+
+cv_plot <- ggplot(data = mt, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "All Data 2000-2020 Prediction Result", x = "Actual", y = "Predicted"
+       ,subtitle = "Cross Validation Model") +
+  theme_minimal()
+cv_plot
+```
+
+#### Variable Importance
+
+```{r}
+importance(rf_cv_model$finalModel)
+```
+
+```{r}
+varImpPlot(rf_cv_model$finalModel)
+```
+
+### Further Tuning our Model
+
+We explored and tried a variety of techniques in this next section in order to improve the accuracy, sensitivity, specificity and precision of our model.
+
+#### Applying Recursive Feature Elimination
+
+We first compute the correlation matrix for the training
+data and then remove highly correlated features before applying
+recursive feature elimination.
+
+```{r}
+cor_matrix <- cor(train_ds_scaled %>% select(where(is.numeric)))
+highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.8)
+train_filtered <- train_ds_scaled %>% select(-all_of(highly_correlated), winner)
+test_filtered <- test_ds_scaled %>% select(-all_of(highly_correlated), winner)
+```
+
+Identifying the best variables to use in our model.
+
+```{r}
+rfe_ctrl <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+rfe_result <- rfe(x = train_filtered[, -which(names(train_filtered) == "winner")], 
+                  y = as.factor(train_filtered$winner), 
+                  sizes = seq(5, min(ncol(train_filtered) - 1, 15), by = 5), 
+                  rfeControl = rfe_ctrl)
+
+best_vars <- predictors(rfe_result)
+```
+
+Saving the best variables to use in our model.
+
+```{r}
+train_rfe <- train_filtered[, c(best_vars, "winner")]
+test_rfe <- test_filtered[, c(best_vars, "winner")]
+```
+
+#### Tuning Hyperparameters
+
+Looking for the optimal number of variables for each tree split.
+
+```{r}
+set.seed(123)
+best_mtry <- tuneRF(train_rfe[, -which(names(train_rfe) == "winner")], as.factor(train_rfe$winner), stepFactor = 1.2, improve = 0.01)
+best_mtry <- as.data.frame(best_mtry)
+```
+
+#### Optimizing Number of Trees
+
+We test different numbers of trees for reach random forest model and
+record the results including the out of bag error which can help us
+define the optimal number of trees for the final model.
+
+```{r}
+tree_results <- data.frame()
+
+set.seed(123)
+
+for (ntree_val in seq(50, 500, by = 50)) {
+  model <- randomForest(
+    as.factor(winner) ~ .,
+    data = train_rfe,
+    ntree = ntree_val,
+    mtry = 3,
+    importance = TRUE
+  )
+  
+  oob_error <- model$err.rate[nrow(model$err.rate), "OOB"] # Extract last row's OOB error
+  
+  tree_results <- rbind(tree_results,
+                        data.frame(ntree = ntree_val, OOB_Error = oob_error))
+}
+
+```
+
+Visualizing Bag Error vs Number of Trees
+
+```{r}
+ggplot(tree_results, aes(x = ntree, y = OOB_Error)) +
+  geom_line(color = "blue") +
+  geom_point() +
+  labs(title = "Effect of ntree on Out of Bag Error", x = "Number of Trees", y = "Out of Bag Error") +
+  theme_minimal()
+```
+
+#### Optimizing Node Size
+
+Here we test different node sizes for each random forest model and
+record the results. The out of the bag error will produced here will
+help us choose the optimal node size for the final model.
+
+```{r}
+nodesize_results <- data.frame()
+
+set.seed(123)
+
+for (size in seq(1, 10, by = 1)) {
+  model <- randomForest(
+    as.factor(winner) ~ .,
+    data = train_rfe,
+    ntree = 100,
+    mtry = 3,
+    nodesize = size,
+    importance = TRUE
+  )
+  
+  oob_error <- model$err.rate[nrow(model$err.rate), "OOB"]
+  
+  nodesize_results <- rbind(nodesize_results,
+                            data.frame(nodesize = size, OOB_Error = oob_error))
+}
+```
+
+Visualizing the effect of node size on OOB error
+
+```{r}
+ggplot(nodesize_results, aes(x = nodesize, y = OOB_Error)) +
+  geom_line(color = "red") +
+  geom_point() + 
+  labs(title = "Effect of nodesize on OOB Error", x = "Node Size", y = "OOB Error") + 
+  theme_minimal()
+```
+
+#### Setting Hyperparameters
+
+We set the hyper parameters for number of trees and node size using the
+configurations with the lowest out of box errors from our models above.
+
+```{r}
+tuned_mtry <- best_mtry %>% filter(OOBError == min(OOBError))
+tuned_trees <- tree_results %>% filter(OOB_Error == min(OOB_Error))
+tuned_nodes <- nodesize_results %>% filter(OOB_Error == min(OOB_Error))
+```
+
+### Training our Optimized Model
+
+Using our tuned hyperparameters, we train our final model.
+
+```{r}
+rf_final <- randomForest(
+  as.factor(winner) ~ .,
+  data = train_rfe,
+  ntree = tuned_trees$ntree[1], ## get hypertuned parameter, if min has more than on value take the first
+  mtry = tuned_mtry$mtry[1], ## get hypertuned parameter, if min has more than on value take the first
+  nodesize = tuned_nodes$nodesize[1], ## get hypertuned parameter, if min has more than on value take the first
+  importance = TRUE
+)
+```
+
+#### Predictions & Evaluation
+
+Below are our predictions and the evaluation of our fully tuned random
+forest model.
+
+```{r}
+predictions_final <- predict(rf_final, test_rfe)
+conf_matrix_final <- confusionMatrix(as.factor(predictions_final), as.factor(test_rfe$winner))
+print(conf_matrix_final)
+```
+
+Model Accuracy and Out of Bag Error
+
+```{r}
+# Print confusion matrix and accuracy
+accuracy <- sum(diag(conf_matrix_final$table)) / sum(conf_matrix_final$table)
+print(paste("Test Accuracy:", round(accuracy, 3)))
+
+## Check Out-of-Bag (OOB) Error
+print(head(rf_final$err.rate,10))
+```
+
+Visualizing our confusion matrix for our tuned model actual vs predicted
+results for Democrat and Republican winners.
+
+```{r}
+rfe_table <- as.data.frame(conf_matrix_final$table)
+
+rfe_plot <- ggplot(data = rfe_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), vjust = 1) +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "All Data 2000-2020 Prediction Result", x = "Actual", y = "Predicted"
+       ,subtitle = "Recursive Feature Elimination and Hypertuning Plot") +
+  theme_minimal()
+rfe_plot
+```
+
+#### Variable Importance
+
+```{r}
+importance(rf_final)
+```
+
+Visualize variable importance
+
+```{r}
+varImpPlot(rf_final)
+```
+
+### Summarizing Results
+
+```{r}
+cm_plots <- (og_plot | cv_plot | rfe_plot)
+cm_plots
+```
+
+## Balancing our Data with SMOTE
+
+### Without Optimized Hyperparameters
+
+Training a new model using balanced data with basic hyperparameters.
+
+```{r}
+set.seed(123)
+train_balanced <- SMOTE(train_ds_scaled[, -which(names(train_ds_scaled) == "winner")], 
+                        train_ds_scaled$winner, 
+                        K = 5, 
+                        dup_size = 2)$data
+
+colnames(train_balanced)[ncol(train_balanced)] <- "winner"
+
+train_balanced$winner <- as.factor(train_balanced$winner)
+
+rf_model_balanced <- randomForest(winner ~ ., data = train_balanced, ntree = 100, mtry = 3, importance = TRUE)
+```
+
+Predictions and Evaluation
+
+```{r}
+predictions_balanced <- predict(rf_model_balanced, test_ds_scaled)
+conf_matrix_balanced <- confusionMatrix(as.factor(predictions_balanced), as.factor(test_ds_scaled$winner))
+print(conf_matrix_balanced)
+```
+
+### With Optimized Hyperparameters
+
+Training with our optimized hyperparameters.
+
+```{r}
+set.seed(123)
+train_balanced <- SMOTE(train_rfe[, -which(names(train_rfe) == "winner")], 
+                        train_rfe$winner, 
+                        K = 5, 
+                        dup_size = 2)$data
+
+colnames(train_balanced)[ncol(train_balanced)] <- "winner"
+
+train_balanced$winner <- as.factor(train_balanced$winner)
+
+rf_model_balanced_rfe <- randomForest(winner ~ ., data = train_balanced
+                                  , ntree = tuned_trees$ntree[1]
+                                  , mtry = tuned_mtry$mtry[1]
+                                  ,nodesize = tuned_nodes$nodesize[1]
+                                  , importance = TRUE)
+```
+
+Predictions and Evaluation
+
+```{r}
+predictions_balanced_rfe <- predict(rf_model_balanced_rfe, test_ds_scaled)
+conf_matrix_balanced_rfe <- confusionMatrix(as.factor(predictions_balanced_rfe), as.factor(test_ds_scaled$winner))
+print(conf_matrix_balanced_rfe)
+```
+
+
